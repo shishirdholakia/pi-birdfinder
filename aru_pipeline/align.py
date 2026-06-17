@@ -25,6 +25,31 @@ class EventPick:
 
 
 @dataclass
+class ImpulseCandidate:
+    unit: str
+    sample: int
+    time_s: float
+    abs_time: datetime
+    snr: float
+    prominence: float
+    score: float
+    peak_sample: int
+    peak_time_s: float
+    width_s: float
+    quality: str
+
+    def as_event_pick(self) -> EventPick:
+        return EventPick(
+            unit=self.unit,
+            sample=self.sample,
+            time_s=self.time_s,
+            abs_time=self.abs_time,
+            snr=self.snr,
+            quality=self.quality,
+        )
+
+
+@dataclass
 class FineAlignment:
     unit: str
     ref_unit: str
@@ -71,6 +96,187 @@ def robust_envelope(x: np.ndarray, fs: int, smooth_ms: float = 5.0) -> np.ndarra
     win = max(1, int(round(smooth_ms * 1e-3 * fs)))
     kernel = np.ones(win) / win
     return np.convolve(x, kernel, mode="same")
+
+
+def robust_mad_stats(x: np.ndarray) -> Tuple[float, float]:
+    """Return robust median and Gaussian-scaled MAD for a 1-D score array."""
+    x = np.asarray(x, dtype=float)
+    if x.size == 0:
+        return 0.0, 1.0
+    med = float(np.median(x))
+    mad = 1.4826 * float(np.median(np.abs(x - med)))
+    return med, max(mad, 1e-12)
+
+
+def _first_threshold_crossing_before_peak(env: np.ndarray, peak_idx: int, fs: int, med: float, mad: float, lookback_s: float = 0.12, onset_z: float = 3.0) -> int:
+    """Pick the first high-frequency envelope onset before a later peak/reverb maximum.
+
+    The peak itself is useful for scoring, but for localization we want the
+    leading broadband edge of the clap.  This finds the beginning of the final
+    above-threshold run immediately preceding the peak.
+    """
+    if env.size == 0:
+        return int(peak_idx)
+    peak_idx = int(np.clip(peak_idx, 0, env.size - 1))
+    start = max(0, peak_idx - int(round(float(lookback_s) * fs)))
+    threshold = med + float(onset_z) * mad
+    above = np.asarray(env[start:peak_idx + 1] > threshold, dtype=bool)
+    if above.size == 0 or not np.any(above):
+        return peak_idx
+
+    # Work backwards from the peak to find the start of the contiguous
+    # above-threshold run that contains, or immediately precedes, the peak.
+    k = above.size - 1
+    while k > 0 and not above[k]:
+        k -= 1
+    while k > 0 and above[k - 1]:
+        k -= 1
+    return int(start + k)
+
+
+def find_impulse_candidates_in_unit(
+    unit: str,
+    uf: UnitFiles,
+    clock: Any,
+    highpass_hz: float = 500.0,
+    bandpass_hz: Optional[Tuple[float, float]] = None,
+    search_start_s: float = 0.0,
+    search_end_s: Optional[float] = None,
+    smooth_ms: float = 0.0,
+    min_snr: float = 8.0,
+    min_prominence: float = 6.0,
+    min_separation_s: float = 0.25,
+    top_k: int = 8,
+    edge_guard_s: float = 0.25,
+    onset_lookback_s: float = 0.12,
+    onset_z: float = 3.0,
+    max_width_s: float = 0.20,
+) -> Sequence[ImpulseCandidate]:
+    """Find candidate clap/impulse onsets anywhere in a unit clip.
+
+    This is intentionally a robust high-frequency envelope detector, not a
+    birdcall/spectrogram classifier. It high-pass/band-pass filters the audio,
+    computes a short smoothed absolute-amplitude envelope, finds prominent
+    robust-z envelope peaks, then moves each candidate pick back to the first
+    threshold crossing before the peak so reverberant maxima are not used as
+    the event time.
+    """
+    fs, nframes, dur_s = audio_info(uf.flac_path)
+    if search_end_s is None:
+        search_end_s = dur_s
+    search_start_s = max(0.0, float(search_start_s))
+    search_end_s = min(float(search_end_s), float(dur_s))
+    if search_end_s <= search_start_s:
+        return []
+
+    seg, fs, start_sample = read_mono_segment(uf.flac_path, search_start_s, search_end_s - search_start_s)
+    if seg.size == 0:
+        return []
+    filt = band_filter(seg, fs, highpass_hz=highpass_hz, bandpass_hz=bandpass_hz)
+    env = robust_envelope(filt, fs, smooth_ms=smooth_ms)
+    if env.size == 0:
+        return []
+    med, mad = robust_mad_stats(env)
+    z = (env - med) / mad
+
+    distance = max(1, int(round(float(min_separation_s) * fs)))
+    peaks, props = signal.find_peaks(
+        z,
+        height=float(min_snr),
+        prominence=float(min_prominence),
+        distance=distance,
+    )
+    if peaks.size == 0:
+        # Fallback: keep the best peak so diagnostics still say what was tried.
+        peak = int(np.argmax(z))
+        peaks = np.asarray([peak], dtype=int)
+        props = {
+            "peak_heights": np.asarray([float(z[peak])]),
+            "prominences": np.asarray([0.0]),
+        }
+
+    try:
+        widths = signal.peak_widths(z, peaks, rel_height=0.5)[0] / float(fs)
+    except Exception:
+        widths = np.zeros(peaks.size, dtype=float)
+
+    candidates = []
+    edge_guard = int(round(float(edge_guard_s) * fs))
+    peak_heights = np.asarray(props.get("peak_heights", z[peaks]), dtype=float)
+    prominences = np.asarray(props.get("prominences", np.zeros(peaks.size)), dtype=float)
+
+    for i, peak_idx_raw in enumerate(peaks):
+        peak_idx = int(peak_idx_raw)
+        if edge_guard > 0 and (peak_idx < edge_guard or peak_idx > env.size - edge_guard - 1):
+            continue
+        onset_idx = _first_threshold_crossing_before_peak(
+            env, peak_idx, fs, med, mad, lookback_s=onset_lookback_s, onset_z=onset_z
+        )
+        sample = int(start_sample + onset_idx)
+        peak_sample = int(start_sample + peak_idx)
+        snr = float(peak_heights[i])
+        prominence = float(prominences[i])
+        width_s = float(widths[i]) if i < len(widths) else 0.0
+        width_penalty = max(0.0, width_s - float(max_width_s)) / max(float(max_width_s), 1e-6)
+        score = float(snr + 0.75 * prominence - 4.0 * width_penalty)
+        quality = "ok" if snr >= min_snr and prominence >= min_prominence else "low_snr"
+        if width_s > max_width_s:
+            quality = f"{quality}_wide"
+        candidates.append(
+            ImpulseCandidate(
+                unit=unit,
+                sample=sample,
+                time_s=sample / float(fs),
+                abs_time=clock.time_from_sample(sample),
+                snr=snr,
+                prominence=prominence,
+                score=score,
+                peak_sample=peak_sample,
+                peak_time_s=peak_sample / float(fs),
+                width_s=width_s,
+                quality=quality,
+            )
+        )
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    if top_k and top_k > 0:
+        candidates = candidates[:int(top_k)]
+    return candidates
+
+
+def pick_impulse_anywhere_in_unit(
+    unit: str,
+    uf: UnitFiles,
+    clock: Any,
+    highpass_hz: float = 300.0,
+    bandpass_hz: Optional[Tuple[float, float]] = None,
+    min_snr: float = 8.0,
+    min_prominence: float = 6.0,
+    min_separation_s: float = 0.25,
+    edge_guard_s: float = 0.25,
+) -> EventPick:
+    """Return the strongest whole-clip impulse candidate as an EventPick.
+
+    This is a single-unit fallback. The localization script normally validates
+    the top candidates across stations before choosing one.
+    """
+    candidates = find_impulse_candidates_in_unit(
+        unit,
+        uf,
+        clock,
+        highpass_hz=highpass_hz,
+        bandpass_hz=bandpass_hz,
+        min_snr=min_snr,
+        min_prominence=min_prominence,
+        min_separation_s=min_separation_s,
+        top_k=1,
+        edge_guard_s=edge_guard_s,
+    )
+    if candidates:
+        return candidates[0].as_event_pick()
+    fs, _, dur_s = audio_info(uf.flac_path)
+    sample = int(round(0.5 * dur_s * fs))
+    return EventPick(unit, sample, sample / fs, clock.time_from_sample(sample), 0.0, "empty")
 
 
 def pick_impulse_in_unit(unit: str, uf: UnitFiles, clock: Any, guess_offset_s: Optional[float], search_half_s: float = 0.5, highpass_hz: float = 300.0, bandpass_hz: Optional[Tuple[float, float]] = None) -> EventPick:
