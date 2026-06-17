@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ARU Controller Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>ARU Controller Dashboard</h1>
+      <p class="subtitle">Unit five controller · health, location averaging, acquisition, calibration, localization, and map overrides</p>
+    </div>
+    <div class="header-status">
+      <div>Last update: <span id="last-update">—</span></div>
+      <div>Location: <span id="location-state" class="pill neutral">—</span></div>
+      <div>Active calibration: <span id="active-calibration">—</span></div>
+      <div>Location override: <span id="active-location-override">—</span></div>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Location Control</h2>
+    <div class="button-row">
+      <button onclick="postAction('/api/location/reset')">Reset location averaging</button>
+      <button onclick="postAction('/api/location/freeze')">Freeze locations</button>
+      <button onclick="postAction('/api/location/unfreeze')">Unfreeze locations</button>
+      <button id="restart-gpsd-btn" class="warn-button" type="button" onclick="restartGpsd()">Restart GPSD on all units</button>
+    </div>
+    <p class="small">Freeze locations before calibration/localization so the pipeline can copy location_summary.txt into fetched event directories. Map override pins below can supersede these positions when enabled.</p>
+    <div id="gpsd-restart-status" class="action-status small">GPSD restart: idle</div>
+  </section>
+
+  <section class="card">
+    <div class="card-title-row">
+      <h2>Map: averaged locations, override pins, and result layers</h2>
+      <span id="map-status" class="small">Map initializing…</span>
+    </div>
+    <div class="map-grid">
+      <div>
+        <div id="aru-map"></div>
+        <p class="small">Satellite tiles require internet access. In the field without internet, saved Folium HTML may load but basemap imagery may not.</p>
+      </div>
+      <div class="map-controls">
+        <h3>Unit override pins</h3>
+        <label class="check"><input id="map-override-enabled" type="checkbox"> Use saved override pins for calibration/localization</label>
+        <div class="button-row tight">
+          <button type="button" onclick="refreshMapLocations()">Refresh map locations</button>
+          <button type="button" onclick="createOverridesFromAverages()">Create pins from averages</button>
+          <button type="button" onclick="saveMapOverrides()">Save override pins</button>
+          <button type="button" onclick="clearMapOverrides()">Clear overrides</button>
+        </div>
+        <div class="row">
+          <select id="map-unit-select"><option value="five">five</option><option value="zero">zero</option><option value="one">one</option><option value="four">four</option></select>
+          <button type="button" onclick="enableClickToPlacePin()">Click map to place selected unit</button>
+        </div>
+        <div id="override-table" class="override-table small">No override pins loaded.</div>
+
+        <h3>Calibration/localization outputs</h3>
+        <div class="button-row tight">
+          <button type="button" onclick="loadLatestResultLayers('calibration')">Show latest calibration</button>
+          <button type="button" onclick="loadLatestResultLayers('localization')">Show latest localization</button>
+          <button type="button" onclick="clearResultLayers()">Clear result layers</button>
+        </div>
+        <p class="small">If a result has a GeoJSON companion file, it is drawn on this map. Otherwise the latest Folium HTML map opens in the artifact preview below.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid-3">
+    <div class="card">
+      <h2>Acquire Clips Only</h2>
+      <label>Timestamp</label>
+      <input id="acq-timestamp" type="text" placeholder="2026-05-05 20:31:00">
+      <label>Clip half-width, s</label>
+      <input id="acq-half" type="number" value="30" step="1">
+      <label>Units</label>
+      <input id="acq-units" type="text" value="zero,one,four,five">
+      <label class="check"><input id="acq-force" type="checkbox"> Force refetch</label>
+      <label class="check"><input id="acq-no-rotate" type="checkbox"> Do not rotate if active</label>
+      <button onclick="submitAcquire()">Ensure clips</button>
+    </div>
+
+    <div class="card">
+      <h2>Calibrate</h2>
+      <label>Calibration clap timestamp</label>
+      <input id="cal-timestamp" type="text" placeholder="2026-05-05 20:31:00">
+      <label>Clip half-width, s</label>
+      <input id="cal-half" type="number" value="10" step="1">
+      <label>Source unit</label>
+      <select id="cal-source-unit"><option value="five">five</option><option value="zero">zero</option><option value="one">one</option><option value="four">four</option></select>
+      <label>Optional source coordinate</label>
+      <div class="row"><input id="cal-source-lat" type="text" placeholder="lat"><input id="cal-source-lon" type="text" placeholder="lon"></div>
+      <label>Event offset in ref clip, optional</label>
+      <input id="cal-offset" type="text" placeholder="middle of clip">
+      <label>Calibration TXT</label>
+      <input id="cal-txt" type="text" value="active" title="active uses data/calibrations/active_session_calibration.txt">
+      <label class="check"><input id="cal-use-overrides" type="checkbox" checked> Use saved map overrides if enabled</label>
+      <button onclick="submitCalibrate()">Acquire + calibrate</button>
+    </div>
+
+    <div class="card">
+      <h2>Localize</h2>
+      <label>Event timestamp</label>
+      <input id="loc-timestamp" type="text" placeholder="2026-05-05 20:31:00">
+      <label>Clip half-width, s</label>
+      <input id="loc-half" type="number" value="30" step="1">
+      <label>Mode</label>
+      <select id="loc-mode"><option value="impulse">impulse</option><option value="birdcall">birdcall</option></select>
+      <label>Calibration</label>
+      <select id="loc-calibration"><option value="active">active</option><option value="none">none</option></select>
+      <label>Event offset in ref clip, optional</label>
+      <input id="loc-offset" type="text" placeholder="middle of clip">
+      <label>Bird bandpass Hz</label>
+      <input id="loc-bird-bandpass" type="text" value="1000,9000">
+      <label class="check"><input id="loc-use-overrides" type="checkbox" checked> Use saved map overrides if enabled</label>
+      <button onclick="submitLocalize()">Acquire + localize</button>
+    </div>
+  </section>
+
+  <section class="card"><h2>Jobs</h2><div class="table-wrap"><table><thead><tr><th>Created</th><th>Kind</th><th>Status</th><th>Outputs</th><th>Artifacts</th><th>Error</th></tr></thead><tbody id="jobs-body"></tbody></table></div></section>
+  <section class="card"><h2>Artifact Preview</h2><div id="artifact-preview" class="preview empty">Select a map, plot, text artifact, or result layer from Jobs/Results.</div></section>
+  <section class="grid-2"><div class="card"><h2>Fetched Events</h2><div id="events-list" class="artifact-list">Loading…</div></div><div class="card"><h2>Calibrations</h2><div id="calibrations-list" class="artifact-list">Loading…</div><h2>Localizations</h2><div id="localizations-list" class="artifact-list">Loading…</div></div></section>
+
+  <section class="card"><h2>Unit Status</h2><div class="table-wrap"><table id="status-table"><thead><tr><th>Unit</th><th>Health</th><th>Reachable</th><th>GPS</th><th>PPS</th><th>SBTS</th><th>JACK</th><th>Disk</th><th>Wi-Fi</th><th>LocFix</th><th>Last seen</th></tr></thead><tbody id="status-body"></tbody></table></div></section>
+  <section class="card"><h2>Location Summary</h2><div class="table-wrap"><table id="location-table"><thead><tr><th>Unit</th><th>Quality</th><th>Latest Fix</th><th>Averaged Position</th><th>N fixes</th><th>Median eph</th><th>Scatter</th></tr></thead><tbody id="location-body"></tbody></table></div></section>
+  <section class="card"><h2>Recent Logs</h2><pre id="logs">Loading…</pre></section>
+
+  <script src="/static/vendor/leaflet/leaflet.js"></script>
+  <script src="/static/dashboard.js?v=local-leaflet-20260525"></script>
+</body>
+</html>
