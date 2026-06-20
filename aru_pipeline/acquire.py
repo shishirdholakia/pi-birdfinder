@@ -60,10 +60,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Remote inspector: intentionally small and dependency-light. It returns enough
 # information to decide whether a timestamp is in a finalized file, in a
-# probably-active/growing file, or not found. It does not create files.
+# active/unfinalized sbts-aru file, or not found. It does not create files.
 INSPECT_WORKER = r'''
 from __future__ import annotations
-import json, os, re, subprocess, sys, time
+import json, re, sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -79,13 +79,22 @@ def parse_ts(s):
 def fmt(dt):
     return dt.strftime("%Y-%m-%d_%H-%M-%S.%f")
 
-def split_name(path):
+def split_completed_name(path):
+    """Completed sbts-aru file: start--unit--end.flac."""
     if path.suffix.lower() != ".flac": return None
     parts = path.stem.split("--")
     if len(parts) < 3: return None
     start_s, unit, end_s = parts[0], parts[1], parts[-1]
     if not TS_RE.match(start_s) or not TS_RE.match(end_s): return None
     try: return parse_ts(start_s), unit, parse_ts(end_s)
+    except Exception: return None
+
+def split_active_name(path):
+    """Active sbts-aru file: start.flac. The unit/end are added only after close/rename."""
+    if path.suffix.lower() != ".flac": return None
+    if "--" in path.stem: return None
+    if not TS_RE.match(path.stem): return None
+    try: return parse_ts(path.stem)
     except Exception: return None
 
 def find_flacs_for_day(target):
@@ -109,52 +118,58 @@ def find_flacs_for_day(target):
             except Exception: pass
     return found
 
-def is_growing(path, sleep_s=0.25):
-    try:
-        s0 = path.stat().st_size
-        m0 = path.stat().st_mtime_ns
-        time.sleep(float(sleep_s))
-        st = path.stat()
-        return st.st_size != s0 or st.st_mtime_ns != m0
-    except Exception:
-        return False
-
 def main():
     args = json.loads(sys.stdin.read() or "{}")
     target = parse_ts(args["target_sbts"])
+    unit_name = str(args.get("unit_name") or "")
     now = datetime.now()
     flacs = find_flacs_for_day(target)
     candidates = []
     for flac in flacs:
-        parsed = split_name(flac)
-        if parsed is None: continue
-        start, unit, end = parsed
         tracking = flac.with_suffix(".tracking")
-        contains_by_name = start <= target <= end
-        maybe_active_by_start = start <= target <= now + timedelta(seconds=5)
-        if not contains_by_name and not maybe_active_by_start:
+
+        completed = split_completed_name(flac)
+        if completed is not None:
+            start, file_unit, end = completed
+            contains_by_name = start <= target <= end
+            if not contains_by_name:
+                continue
+            candidates.append({
+                "score": 0,
+                "filename_state": "completed",
+                "source_flac": str(flac),
+                "source_tracking": str(tracking),
+                "source_start": fmt(start),
+                "source_end": fmt(end),
+                "source_unit": file_unit,
+                "contains_by_filename": True,
+                "active": False,
+                "tracking_exists": tracking.exists(),
+            })
             continue
-        growing = is_growing(flac) or (tracking.exists() and is_growing(tracking))
-        recent = False
-        try:
-            mt = max(flac.stat().st_mtime, tracking.stat().st_mtime if tracking.exists() else 0)
-            recent = (time.time() - mt) < 20
-        except Exception: pass
-        active = bool(growing or (recent and maybe_active_by_start and not contains_by_name))
-        score = 0 if contains_by_name else 1
-        candidates.append({
-            "score": score,
-            "source_flac": str(flac),
-            "source_tracking": str(tracking),
-            "source_start": fmt(start),
-            "source_end": fmt(end),
-            "source_unit": unit,
-            "contains_by_filename": contains_by_name,
-            "growing": growing,
-            "recent_mtime": recent,
-            "active": active,
-            "tracking_exists": tracking.exists(),
-        })
+
+        active_start = split_active_name(flac)
+        if active_start is not None:
+            # sbts-aru active files have no end in the filename. If the target is
+            # between the active start and now, the file is still being written
+            # and must be closed/renamed by HUP before the clip worker can read it.
+            if active_start <= target <= now + timedelta(seconds=5):
+                candidates.append({
+                    "score": 1,
+                    "filename_state": "active_unfinalized",
+                    "source_flac": str(flac),
+                    "source_tracking": str(tracking),
+                    "source_start": fmt(active_start),
+                    "source_end": "",
+                    "source_unit": unit_name,
+                    "contains_by_filename": False,
+                    "active": True,
+                    "tracking_exists": tracking.exists(),
+                })
+            continue
+
+    # Prefer a finalized containing file if one exists; otherwise active files
+    # deliberately trigger rotation in the acquisition layer.
     candidates.sort(key=lambda d: (d["score"], d["source_start"]), reverse=False)
     best = candidates[0] if candidates else None
     status = "not_found"
@@ -182,7 +197,7 @@ class AcquisitionResult:
 
 
 def _run_remote_inspect(unit: UnitConfig, target: datetime, timeout_s: float = 20.0) -> Dict[str, Any]:
-    payload = {"target_sbts": format_ts(target)}
+    payload = {"target_sbts": format_ts(target), "unit_name": unit.name}
     if unit.transport == "local":
         cmd = ["python3", "-c", INSPECT_WORKER]
     else:

@@ -71,12 +71,21 @@ def ts_from_line(line: str, base_date: date | None = None):
     return None
 
 def split_sbts_name(path: Path):
-    if path.suffix != ".flac": return None
+    """Completed sbts-aru file: start--unit--end.flac."""
+    if path.suffix.lower() != ".flac": return None
     parts = path.stem.split("--")
     if len(parts) < 3: return None
     start_s, unit, end_s = parts[0], parts[1], parts[-1]
     if not FULL_TS_RE.match(start_s) or not FULL_TS_RE.match(end_s): return None
     try: return parse_ts(start_s), unit, parse_ts(end_s)
+    except Exception: return None
+
+def split_active_sbts_name(path: Path):
+    """Active sbts-aru file: start.flac. End/unit are added after close/rename."""
+    if path.suffix.lower() != ".flac": return None
+    if "--" in path.stem: return None
+    if not FULL_TS_RE.match(path.stem): return None
+    try: return parse_ts(path.stem)
     except Exception: return None
 
 def find_flacs_for_day(target: datetime):
@@ -123,31 +132,62 @@ def tracking_range_contains(path: Path, target: datetime, base_dt: datetime | No
     except Exception: return False
     return bool(times) and min(times) <= target <= max(times)
 
-def find_source_file(target: datetime):
+def active_file_containing_target(flacs, target: datetime, unit_name: str | None = None):
+    now = datetime.now()
+    matches = []
+    for flac in flacs:
+        active_start = split_active_sbts_name(flac)
+        if active_start is None:
+            continue
+        if active_start <= target <= now + timedelta(seconds=5):
+            tracking = flac.with_suffix(".tracking")
+            matches.append({
+                "source_flac": str(flac),
+                "source_tracking": str(tracking),
+                "source_start": format_ts(active_start),
+                "source_unit": unit_name or "",
+                "tracking_exists": tracking.exists(),
+            })
+    matches.sort(key=lambda d: d["source_start"], reverse=True)
+    return matches[0] if matches else None
+
+def find_source_file(target: datetime, unit_name: str | None = None):
+    flacs = find_flacs_for_day(target)
+
     candidates = []
-    for flac in find_flacs_for_day(target):
+    for flac in flacs:
         parsed = split_sbts_name(flac)
         if parsed is None: continue
-        start_dt, unit_name, end_dt = parsed
+        start_dt, unit_name_from_file, end_dt = parsed
         tracking = flac.with_suffix(".tracking")
         if start_dt <= target <= end_dt and tracking.exists():
-            candidates.append((start_dt, end_dt, unit_name, flac, tracking, "filename_interval"))
+            candidates.append((start_dt, end_dt, unit_name_from_file, flac, tracking, "filename_interval"))
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
-        start_dt, end_dt, unit_name, flac, tracking, method = candidates[0]
-        return {"source_flac": str(flac), "source_tracking": str(tracking), "source_start": format_ts(start_dt), "source_end": format_ts(end_dt), "source_unit": unit_name, "match_method": method}
+        start_dt, end_dt, unit_name_from_file, flac, tracking, method = candidates[0]
+        return {"source_flac": str(flac), "source_tracking": str(tracking), "source_start": format_ts(start_dt), "source_end": format_ts(end_dt), "source_unit": unit_name_from_file, "match_method": method}
+
     matches = []
-    for flac in find_flacs_for_day(target):
+    for flac in flacs:
         parsed = split_sbts_name(flac)
         if parsed is None: continue
-        start_dt, unit_name, end_dt = parsed
+        start_dt, unit_name_from_file, end_dt = parsed
         tracking = flac.with_suffix(".tracking")
         if tracking.exists() and tracking_range_contains(tracking, target, start_dt):
-            matches.append((start_dt, end_dt, unit_name, flac, tracking, "tracking_range"))
+            matches.append((start_dt, end_dt, unit_name_from_file, flac, tracking, "tracking_range"))
     if matches:
         matches.sort(key=lambda x: x[0], reverse=True)
-        start_dt, end_dt, unit_name, flac, tracking, method = matches[0]
-        return {"source_flac": str(flac), "source_tracking": str(tracking), "source_start": format_ts(start_dt), "source_end": format_ts(end_dt), "source_unit": unit_name, "match_method": method}
+        start_dt, end_dt, unit_name_from_file, flac, tracking, method = matches[0]
+        return {"source_flac": str(flac), "source_tracking": str(tracking), "source_start": format_ts(start_dt), "source_end": format_ts(end_dt), "source_unit": unit_name_from_file, "match_method": method}
+
+    active = active_file_containing_target(flacs, target, unit_name)
+    if active is not None:
+        raise RuntimeError(
+            "Target appears to be in an active/unfinalized sbts-aru file "
+            f"({active['source_flac']}). Send HUP/rotate, wait for sbts-aru to rename "
+            "it to start--unit--end.flac, then retry clipping."
+        )
+
     raise RuntimeError(f"No finalized FLAC+tracking file found containing {format_ts(target)}")
 
 def get_sample_rate(flac: Path) -> int:
@@ -210,7 +250,8 @@ def main():
     args = json.loads(sys.stdin.read())
     target = parse_ts(args["target_sbts"])
     half_s = float(args.get("clip_half_s", 30.0))
-    source = find_source_file(target)
+    unit_name = str(args.get("unit_name") or "")
+    source = find_source_file(target, unit_name)
     source_flac, source_tracking = Path(source["source_flac"]), Path(source["source_tracking"])
     source_start_dt = parse_ts(source["source_start"])
     unit_name = source["source_unit"]
@@ -288,10 +329,23 @@ def run_worker(unit: UnitConfig, input_json: dict[str, Any], timeout_s: float) -
     else:
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", f"{unit.user}@{unit.host}", remote_cmd]
     proc = subprocess.run(cmd, input=json.dumps(input_json), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
-    if proc.returncode != 0:
-        return {"ok": False, "error": proc.stderr.strip() or proc.stdout.strip() or f"return code {proc.returncode}", "stdout": proc.stdout, "stderr": proc.stderr}
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-    return json.loads(lines[-1])
+    parsed: dict[str, Any] | None = None
+    if lines:
+        try:
+            parsed = json.loads(lines[-1])
+        except Exception:
+            parsed = None
+    if proc.returncode != 0:
+        if parsed is not None:
+            parsed.setdefault("ok", False)
+            parsed.setdefault("stdout", proc.stdout)
+            parsed.setdefault("stderr", proc.stderr)
+            return parsed
+        return {"ok": False, "error": proc.stderr.strip() or proc.stdout.strip() or f"return code {proc.returncode}", "stdout": proc.stdout, "stderr": proc.stderr}
+    if parsed is None:
+        raise RuntimeError(f"bad worker output from {unit.name}: {proc.stdout!r}")
+    return parsed
 
 
 def rotate_unit(unit: UnitConfig, timeout_s: float = 10.0) -> dict[str, Any]:
@@ -347,7 +401,7 @@ def load_location_summary(unit_name: str) -> dict[str, Any] | None:
 
 def process_unit(unit: UnitConfig, target: datetime, clip_half_s: float, dest_root: Path, worker_timeout_s: float) -> dict[str, Any]:
     unit_dir = dest_root / unit.name; unit_dir.mkdir(parents=True, exist_ok=True)
-    result = run_worker(unit, {"target_sbts": format_ts(target), "clip_half_s": clip_half_s}, worker_timeout_s)
+    result = run_worker(unit, {"target_sbts": format_ts(target), "clip_half_s": clip_half_s, "unit_name": unit.name}, worker_timeout_s)
     if not result.get("ok"):
         return {"unit": unit.name, "ok": False, "error": result.get("error", "unknown worker error")}
     copied = {}

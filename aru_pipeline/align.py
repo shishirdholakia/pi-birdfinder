@@ -91,7 +91,7 @@ def band_filter(x: np.ndarray, fs: int, highpass_hz: Optional[float] = None, low
         return signal.sosfilt(sos, x).astype(np.float32)
 
 
-def robust_envelope(x: np.ndarray, fs: int, smooth_ms: float = 5.0) -> np.ndarray:
+def robust_envelope(x: np.ndarray, fs: int, smooth_ms: float = 0.0) -> np.ndarray:
     x = np.abs(np.asarray(x, dtype=float))
     win = max(1, int(round(smooth_ms * 1e-3 * fs)))
     kernel = np.ones(win) / win
@@ -286,7 +286,7 @@ def pick_impulse_in_unit(unit: str, uf: UnitFiles, clock: Any, guess_offset_s: O
     start_s = max(0.0, float(guess_offset_s) - float(search_half_s))
     seg, fs, start_sample = read_mono_segment(uf.flac_path, start_s, 2.0 * search_half_s)
     filt = band_filter(seg, fs, highpass_hz=highpass_hz, bandpass_hz=bandpass_hz)
-    env = robust_envelope(filt, fs, smooth_ms=3.0)
+    env = robust_envelope(filt, fs, smooth_ms=0.0)
     if env.size == 0:
         sample = int(round(guess_offset_s * fs))
         return EventPick(unit, sample, sample / fs, clock.time_from_sample(sample), 0.0, "empty")
