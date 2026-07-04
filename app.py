@@ -597,11 +597,11 @@ ARTIFACT_EXTS = {".html", ".htm", ".png", ".jpg", ".jpeg", ".txt", ".csv", ".h5"
 
 def _cfg_path(section: str, key: str, default: Path) -> Path:
     val = CONFIG.get(section, {}).get(key)
-    return Path(val).expanduser() if val else default
+    return _resolve_dashboard_path(val, default)
 
 
 def clips_root() -> Path:
-    return Path(CONFIG.get("clips", {}).get("output_root", EVENT_CLIPS_DIR)).expanduser()
+    return _resolve_dashboard_path(CONFIG.get("clips", {}).get("output_root"), EVENT_CLIPS_DIR)
 
 
 def jobs_root() -> Path:
@@ -866,7 +866,8 @@ def resolve_locations_arg(payload: dict[str, Any], job: dict[str, Any] | None = 
     use_override = bool(payload.get("use_location_override") or payload.get("use_map_overrides"))
     if use_override:
         p = active_location_override_file()
-        if p.exists() and location_override_enabled():
+        enabled = location_override_enabled()
+        if p.exists() and enabled:
             try:
                 normalized = ensure_pipeline_location_override_txt(p)
                 return normalized or p
@@ -875,7 +876,8 @@ def resolve_locations_arg(payload: dict[str, Any], job: dict[str, Any] | None = 
                     _append_job_log(job, f"[warn] could not normalize active location override {p}: {e}; passing original file.")
                 return p
         if job is not None:
-            _append_job_log(job, "[warn] use_location_override requested but no enabled override file exists; using event/default locations.")
+            reason = "missing" if not p.exists() else "disabled"
+            _append_job_log(job, f"[warn] use_location_override requested but active override file is {reason}: {p}; enabled={enabled}; using event/default locations.")
     return None
 
 
@@ -891,6 +893,8 @@ def resolve_active_calibration() -> Path | None:
     pointer = active_calibration_pointer()
     if pointer.exists():
         p = Path(pointer.read_text(encoding="utf-8").strip()).expanduser()
+        if not p.is_absolute():
+            p = BASE_DIR / p
         if p.exists():
             return p
     default = active_calibration_default()
@@ -898,18 +902,18 @@ def resolve_active_calibration() -> Path | None:
 
 
 def pipeline_python() -> str:
-    return str(Path(CONFIG.get("pipeline", {}).get("python", sys.executable)).expanduser())
+    return str(_resolve_dashboard_path(CONFIG.get("pipeline", {}).get("python"), Path(sys.executable)))
 
 
 def pipeline_script(name: str) -> Path:
     pcfg = CONFIG.get("pipeline", {})
     configured = {"acquire.py": pcfg.get("acquire_script"), "aru_calibrate_session.py": pcfg.get("calibrate_script"), "aru_localize_event.py": pcfg.get("localize_script")}.get(name)
+    script_dir = _resolve_dashboard_path(pcfg.get("script_dir"), BASE_DIR / "pipeline")
     if configured:
         p = Path(configured).expanduser()
         if not p.is_absolute():
-            p = Path(pcfg.get("script_dir", BASE_DIR / "pipeline")).expanduser() / p
+            p = script_dir / p
         return p
-    script_dir = Path(pcfg.get("script_dir", BASE_DIR / "pipeline")).expanduser()
     candidates = [script_dir / name, BASE_DIR / name, BASE_DIR / "aru_pipeline_scripts" / name]
     for c in candidates:
         if c.exists():
@@ -926,6 +930,23 @@ def parse_units(value: Any) -> str:
             return str(default)
         return ",".join(CONFIG.get("units", {}).keys())
     return str(value).replace(" ", ",")
+
+
+def payload_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "none", "null"}:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def safe_label(s: str) -> str:
@@ -1082,15 +1103,35 @@ async def run_localization_for_job(job: dict[str, Any], payload: dict[str, Any],
     timestamp = str(payload.get("timestamp") or payload.get("event_time") or datetime.now().isoformat())
     out_dir = Path(payload.get("out_dir") or (localizations_root() / f"localization_{timestamp_label(timestamp)}_{job['job_id'][-8:]}"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [pipeline_python(), str(pipeline_script("aru_localize_event.py")), event_dir, "--ref", str(payload.get("ref", "five")), "--mode", str(payload.get("mode", "impulse")), "--units", parse_units(payload.get("units")), "--out-dir", str(out_dir), "--sound-speed", str(float(payload.get("sound_speed", 343.0))), "--max-tau-s", str(float(payload.get("max_tau_s", 0.10))), "--highpass-hz", str(float(payload.get("highpass_hz", 300.0))), "--draws", str(int(payload.get("draws", 2000))), "--mc", str(int(payload.get("mc", 1000)))]
+    mode = str(payload.get("mode", "impulse") or "impulse").strip()
+    cmd = [pipeline_python(), str(pipeline_script("aru_localize_event.py")), event_dir, "--ref", str(payload.get("ref", "five")), "--mode", mode, "--units", parse_units(payload.get("units")), "--out-dir", str(out_dir), "--sound-speed", str(float(payload.get("sound_speed", 343.0))), "--max-tau-s", str(float(payload.get("max_tau_s", 0.10))), "--highpass-hz", str(float(payload.get("highpass_hz", 300.0))), "--draws", str(int(payload.get("draws", 2000))), "--mc", str(int(payload.get("mc", 1000)))]
     if payload.get("event_ref_offset"):
         cmd.extend(["--event-ref-offset", str(payload["event_ref_offset"])])
     loc_path = resolve_locations_arg(payload, job)
     if loc_path is not None:
         cmd.extend(["--locations", str(loc_path)])
         job["outputs"]["locations_used"] = str(loc_path)
-    if payload.get("bird_bandpass"):
-        cmd.extend(["--bird-bandpass", str(payload["bird_bandpass"])])
+    if mode == "birdcall":
+        bird_bandpass = str(payload.get("bird_bandpass") or "3000,8000")
+        cmd.extend(["--bird-bandpass", bird_bandpass])
+        birdnet_detect = payload_bool(payload.get("birdnet_detect"), True)
+        if birdnet_detect:
+            cmd.append("--birdnet-detect")
+        window_mode = str(payload.get("birdcall_window_mode") or "multisyllable").strip()
+        if window_mode not in {"multisyllable", "minimal"}:
+            raise RuntimeError(f"Unsupported birdcall_window_mode: {window_mode}")
+        cmd.extend(["--birdcall-window-mode", window_mode])
+        birdcall_options = [
+            ("birdcall_envelope_z_threshold", "--birdcall-envelope-z-threshold", float),
+            ("birdcall_envelope_smooth_ms", "--birdcall-envelope-smooth-ms", float),
+            ("birdcall_phrase_merge_gap_s", "--birdcall-phrase-merge-gap-s", float),
+            ("birdcall_phrase_min_duration_s", "--birdcall-phrase-min-duration-s", float),
+            ("birdcall_phrase_min_syllables", "--birdcall-phrase-min-syllables", int),
+        ]
+        for key, flag, caster in birdcall_options:
+            if payload.get(key) not in (None, ""):
+                cmd.extend([flag, str(caster(payload[key]))])
+        job["outputs"].update({"birdnet_detect": str(birdnet_detect), "birdcall_window_mode": window_mode, "bird_bandpass": bird_bandpass})
     cal_mode = str(payload.get("calibration", "active")).strip()
     cal_path: Path | None = None
     if cal_mode not in {"", "none", "None", "false"}:
@@ -1304,7 +1345,7 @@ async def api_save_location_overrides(payload: dict[str, Any] = Body(default={})
     units = payload.get("units") or {}
     if not isinstance(units, dict):
         raise HTTPException(status_code=400, detail="units must be an object keyed by unit name")
-    enabled = bool(payload.get("enabled", True))
+    enabled = payload_bool(payload.get("enabled"), True)
     p = write_location_override_txt(units, enabled=enabled)
     add_log(f"location override pins saved to {p}; enabled={enabled}")
     return {"ok": True, "path": str(p), "enabled": enabled, "overrides": parse_location_override_txt(p)}

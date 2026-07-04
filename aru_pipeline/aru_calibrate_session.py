@@ -13,7 +13,14 @@ from aru_io import (
 )
 from align import pick_impulse_in_unit, fine_align_impulse
 from tdoa import build_tdoa_from_alignment, expected_tdoa_s
-from calibration import load_calibration_txt, update_tables_with_event, fit_geometry_and_timing, write_calibration_txt
+from calibration import (
+    fit_geometry_and_timing,
+    load_calibration_txt,
+    project_relative_text,
+    session_calibration_output_path,
+    update_tables_with_event,
+    write_calibration_txt,
+)
 from maps import write_station_fit_map
 from viz import plot_alignment_diagnostics
 
@@ -49,7 +56,11 @@ def source_from_args(args, stations, ref_unit, ref_latlon, pos_xy):
 def main() -> int:
     p = argparse.ArgumentParser(description="Create/update an ARU TXT calibration file from a known clap event.")
     p.add_argument("event_dir", help="Fetched calibration event directory from rotate_fetch_clips_txt.py")
-    p.add_argument("--calibration-txt", default="session_calibration.txt", help="Calibration TXT to create/update.")
+    p.add_argument(
+        "--calibration-txt",
+        default=None,
+        help="Calibration TXT to create/update. Default: data/calibrations/station_offset_calibrations/session_calibration.txt.",
+    )
     p.add_argument("--ref", default="five")
     p.add_argument("--source-unit", choices=["zero", "one", "four", "five"], default="five", help="Unit where the clap occurred. Default: five.")
     p.add_argument("--source-lat", type=float, default=None)
@@ -112,11 +123,11 @@ def main() -> int:
 
     plot_alignment_diagnostics(outdir / "diagnostics", unit_files, clocks, ref_pick, tdoa_for_plot, ref_unit=args.ref, highpass_hz=args.highpass_hz)
 
-    cal_path = Path(args.calibration_txt)
+    cal_path = Path(args.calibration_txt).expanduser() if args.calibration_txt else session_calibration_output_path()
     existing_kv, existing_tables = load_calibration_txt(cal_path)
     event_meta = {
         "event_id": event_id_from_dir(event_dir),
-        "event_dir": str(event_dir),
+        "event_dir": project_relative_text(event_dir),
         "ref_unit": args.ref,
         **source_meta,
     }

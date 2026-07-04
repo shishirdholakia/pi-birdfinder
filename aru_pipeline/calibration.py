@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import math
@@ -11,6 +12,45 @@ from scipy import optimize
 
 from aru_io import read_sectioned_tables, write_sectioned_tables, xy_to_latlon
 from tdoa import expected_tdoa_s
+
+
+PROJECT_ROOT_ENV = "ARU_DASHBOARD_ROOT"
+STATION_OFFSET_CALIBRATION_DIR = Path("data") / "calibrations" / "station_offset_calibrations"
+DEFAULT_STATION_OFFSET_CALIBRATION_TXT = (
+    STATION_OFFSET_CALIBRATION_DIR / "joint_station_offsets_manual_override_16-06_16-17_calibration.txt"
+)
+
+
+def project_root() -> Path:
+    root = os.environ.get(PROJECT_ROOT_ENV)
+    if root:
+        return Path(root).expanduser().resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+def project_path(relative_path: Path | str) -> Path:
+    path = Path(relative_path).expanduser()
+    return path if path.is_absolute() else project_root() / path
+
+
+def project_relative_text(path: Path | str) -> str:
+    path = Path(path).expanduser()
+    try:
+        return str(path.resolve().relative_to(project_root()))
+    except Exception:
+        return str(path)
+
+
+def station_offset_calibration_dir() -> Path:
+    return project_path(STATION_OFFSET_CALIBRATION_DIR)
+
+
+def default_station_offset_calibration_path() -> Path:
+    return project_path(DEFAULT_STATION_OFFSET_CALIBRATION_TXT)
+
+
+def session_calibration_output_path(filename: str = "session_calibration.txt") -> Path:
+    return station_offset_calibration_dir() / filename
 
 
 @dataclass

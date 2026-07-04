@@ -7,15 +7,18 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from align import BirdcallCandidate
-from aru_io import find_unit_files
+import numpy as np
+
+from align import BirdcallCandidate, band_filter, robust_envelope, robust_mad_stats
+from aru_io import audio_info, find_unit_files, read_mono_segment
 from birdnet_detect import merge_birdnet_candidates, run_birdnet_predictions, write_birdnet_candidates_csv
 from birdnet_species import build_event_species_list
 
 
 CROSS_UNIT_SOURCE = "predictions:min_overlap"
+MULTISYLLABLE_SOURCE = "predictions:multisyllable_phrase"
 
 
 @dataclass
@@ -236,6 +239,372 @@ def _write_calls_csv(path: Path, calls: List[dict]) -> None:
             row["call_id"] = f"call_{idx:04d}"
             row["center_s"] = 0.5 * (start_s + end_s)
             writer.writerow(row)
+
+
+def _mad_scale(x: np.ndarray, floor: float = 1e-12) -> tuple[float, float]:
+    med, scale = robust_mad_stats(np.asarray(x, dtype=float))
+    return float(med), max(float(scale), float(floor))
+
+
+def _load_normalized_envelope(path: Path, bandpass_hz: Tuple[float, float], smooth_ms: float) -> tuple[np.ndarray, int, float]:
+    fs, _n, dur_s = audio_info(path)
+    audio, fs_read, _ = read_mono_segment(path, 0.0, dur_s)
+    if fs_read != fs:
+        raise RuntimeError(f"Unexpected samplerate mismatch for {path}")
+    filt = band_filter(audio, fs, bandpass_hz=bandpass_hz)
+    env = robust_envelope(filt, fs, smooth_ms=smooth_ms)
+    med, scale = _mad_scale(env)
+    return ((env - med) / scale).astype(np.float32), fs, dur_s
+
+
+def build_cross_unit_aggregate_envelope(
+    unit_files: Dict[str, Any],
+    clocks: Dict[str, Any],
+    units: Sequence[str],
+    ref_unit: str,
+    bandpass_hz: Tuple[float, float],
+    smooth_ms: float,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    """Return median normalized envelope on the reference unit's timeline."""
+    fs_ref, n_ref, _dur_ref = audio_info(unit_files[ref_unit].flac_path)
+    t_ref = np.arange(n_ref, dtype=float) / float(fs_ref)
+    ref_start_abs = clocks[ref_unit].time_from_sample(0)
+    per_unit_on_ref: Dict[str, np.ndarray] = {}
+    aligned = []
+
+    for unit in units:
+        if unit not in unit_files:
+            continue
+        env_z, fs_u, dur_u = _load_normalized_envelope(unit_files[unit].flac_path, bandpass_hz, smooth_ms)
+        unit_start_abs = clocks[unit].time_from_sample(0)
+        unit_offset_s = (unit_start_abs - ref_start_abs).total_seconds()
+        t_unit_ref = unit_offset_s + np.arange(env_z.size, dtype=float) / float(fs_u)
+        interp = np.interp(t_ref, t_unit_ref, env_z, left=np.nan, right=np.nan)
+        per_unit_on_ref[unit] = interp.astype(np.float32)
+        aligned.append(interp)
+        if dur_u <= 0.0:
+            raise RuntimeError(f"Invalid audio duration for {unit}")
+
+    if not aligned:
+        raise RuntimeError("No envelopes were built")
+    stack = np.vstack(aligned)
+    aggregate = np.nanmedian(stack, axis=0)
+    aggregate = np.where(np.isfinite(aggregate), aggregate, np.nan)
+    if not np.isfinite(aggregate).any():
+        raise RuntimeError("Aggregate envelope is entirely NaN")
+    return t_ref, aggregate.astype(np.float32), per_unit_on_ref
+
+
+def _interval_stats(t: np.ndarray, y: np.ndarray, start_s: float, end_s: float) -> tuple[float, float]:
+    mask = (t >= float(start_s)) & (t <= float(end_s)) & np.isfinite(y)
+    if not np.any(mask):
+        return float("nan"), float("nan")
+    vals = y[mask]
+    return float(np.nanmax(vals)), float(np.nanmedian(vals))
+
+
+def _parse_per_unit_confidence(text: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for item in str(text or "").split(";"):
+        if ":" not in item:
+            continue
+        unit, value = item.split(":", 1)
+        try:
+            out[unit.strip()] = max(float(value), out.get(unit.strip(), float("-inf")))
+        except Exception:
+            continue
+    return out
+
+
+def _phrase_per_unit_confidence(calls: Sequence[dict]) -> str:
+    per_unit: Dict[str, float] = {}
+    for call in calls:
+        for unit, conf in _parse_per_unit_confidence(str(call.get("per_unit_confidence", ""))).items():
+            per_unit[unit] = max(float(conf), per_unit.get(unit, float("-inf")))
+    return ";".join(f"{u}:{float(per_unit[u]):.6f}" for u in sorted(per_unit))
+
+
+def _phrase_species_by_unit(species_name: str, units: str) -> str:
+    return ";".join(f"{u}:{species_name}" for u in str(units).split(",") if u)
+
+
+def _calls_to_envelope_gated_syllables(
+    calls: List[dict],
+    t_env: np.ndarray,
+    agg_env_z: np.ndarray,
+    threshold_z: float,
+) -> List[dict]:
+    out: List[dict] = []
+    for idx, call in enumerate(calls, start=1):
+        start_s = float(call["start_s"])
+        end_s = float(call["end_s"])
+        peak_z, median_z = _interval_stats(t_env, agg_env_z, start_s, end_s)
+        if not math.isfinite(peak_z) or peak_z < float(threshold_z):
+            continue
+        row = dict(call)
+        row["call_id"] = str(call.get("call_id") or f"call_{idx:04d}")
+        row["envelope_peak_z"] = float(peak_z)
+        row["envelope_median_z"] = float(median_z)
+        out.append(row)
+    return out
+
+
+def _append_phrase(
+    phrases: List[dict],
+    species_name: str,
+    syllables: List[dict],
+    t_env: np.ndarray,
+    agg_env_z: np.ndarray,
+    min_duration_s: float,
+    min_syllables: int,
+) -> None:
+    if not syllables:
+        return
+    start_s = min(float(s["start_s"]) for s in syllables)
+    end_s = max(float(s["end_s"]) for s in syllables)
+    if end_s - start_s < float(min_duration_s):
+        return
+    if len(syllables) < int(min_syllables):
+        return
+    peak_z, median_z = _interval_stats(t_env, agg_env_z, start_s, end_s)
+    confidences = [float(s.get("avg_confidence", float("nan"))) for s in syllables if math.isfinite(float(s.get("avg_confidence", float("nan"))))]
+    max_confidences = [float(s.get("max_confidence", float("nan"))) for s in syllables if math.isfinite(float(s.get("max_confidence", float("nan"))))]
+    units = ",".join(sorted({u for s in syllables for u in str(s.get("units", "")).split(",") if u}))
+    per_unit_confidence = _phrase_per_unit_confidence(syllables)
+    parsed_conf = _parse_per_unit_confidence(per_unit_confidence)
+    best_unit = max(parsed_conf, key=lambda u: parsed_conf[u]) if parsed_conf else ""
+    other = [conf for unit, conf in parsed_conf.items() if unit != best_unit]
+    phrases.append({
+        "phrase_id": "",
+        "species_name": species_name,
+        "start_s": float(start_s),
+        "end_s": float(end_s),
+        "duration_s": float(end_s - start_s),
+        "n_syllables": len(syllables),
+        "n_units": len([u for u in units.split(",") if u]),
+        "units": units,
+        "avg_confidence": float(np.mean(confidences)) if confidences else float("nan"),
+        "max_confidence": max(max_confidences) if max_confidences else float("nan"),
+        "source_windows": sum(int(s.get("source_windows", 1)) for s in syllables),
+        "per_unit_confidence": per_unit_confidence,
+        "cross_unit_source": MULTISYLLABLE_SOURCE,
+        "species_by_unit": _phrase_species_by_unit(species_name, units),
+        "best_unit": best_unit,
+        "other_min_confidence": min(other) if other else float("nan"),
+        "envelope_peak_z": float(peak_z),
+        "envelope_median_z": float(median_z),
+        "syllables": list(syllables),
+        "syllable_windows_s": ";".join(f"{float(s['start_s']):.6f}-{float(s['end_s']):.6f}" for s in syllables),
+        "syllable_peak_z": ";".join(f"{float(s['envelope_peak_z']):.3f}" for s in syllables),
+    })
+
+
+def build_multisyllable_phrase_windows(
+    result: BirdnetClipDetectionResult,
+    unit_files: Dict[str, Any],
+    clocks: Dict[str, Any],
+    units: Sequence[str],
+    ref_unit: str,
+    bandpass_hz: Tuple[float, float],
+    *,
+    envelope_z_threshold: float = 7.0,
+    envelope_smooth_ms: float = 8.0,
+    phrase_merge_gap_s: float = 0.35,
+    phrase_min_duration_s: float = 0.25,
+    phrase_min_syllables: int = 2,
+) -> tuple[List[dict], np.ndarray, np.ndarray]:
+    t_env, agg_env_z, _per_unit = build_cross_unit_aggregate_envelope(
+        unit_files,
+        clocks,
+        units,
+        ref_unit,
+        bandpass_hz,
+        envelope_smooth_ms,
+    )
+    syllables = _calls_to_envelope_gated_syllables(result.calls, t_env, agg_env_z, envelope_z_threshold)
+    syllables.sort(key=lambda s: (str(s["species_name"]), float(s["start_s"]), float(s["end_s"])))
+    phrases: List[dict] = []
+    cur: List[dict] = []
+    cur_species = ""
+    for syl in syllables:
+        species = str(syl["species_name"])
+        if not cur:
+            cur = [syl]
+            cur_species = species
+            continue
+        prev = cur[-1]
+        if species == cur_species and float(syl["start_s"]) - float(prev["end_s"]) <= float(phrase_merge_gap_s) + 1e-9:
+            cur.append(syl)
+        else:
+            _append_phrase(phrases, cur_species, cur, t_env, agg_env_z, phrase_min_duration_s, phrase_min_syllables)
+            cur = [syl]
+            cur_species = species
+    if cur:
+        _append_phrase(phrases, cur_species, cur, t_env, agg_env_z, phrase_min_duration_s, phrase_min_syllables)
+
+    phrases.sort(key=lambda p: (float(p["start_s"]), str(p["species_name"])))
+    for idx, phrase in enumerate(phrases, start=1):
+        phrase["phrase_id"] = f"phrase_{idx:04d}"
+    return phrases, t_env, agg_env_z
+
+
+def write_multisyllable_phrase_windows_csv(path: Path, phrases: List[dict], selected_phrase_id: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = [
+        "phrase_id",
+        "selected",
+        "species_name",
+        "start_s",
+        "end_s",
+        "duration_s",
+        "n_syllables",
+        "n_units",
+        "units",
+        "avg_confidence",
+        "max_confidence",
+        "source_windows",
+        "per_unit_confidence",
+        "cross_unit_source",
+        "envelope_peak_z",
+        "envelope_median_z",
+        "syllable_windows_s",
+        "syllable_peak_z",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for phrase in phrases:
+            row = {k: phrase.get(k, "") for k in keys}
+            row["selected"] = "yes" if str(phrase.get("phrase_id", "")) == str(selected_phrase_id) else ""
+            writer.writerow(row)
+
+
+def plot_multisyllable_phrase_diagnostic(
+    path: Path,
+    t_env: np.ndarray,
+    agg_env_z: np.ndarray,
+    phrases: List[dict],
+    selected_phrase_id: str,
+    threshold_z: float,
+    bandpass_hz: Tuple[float, float],
+) -> None:
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(14, 5), constrained_layout=True)
+    ax.plot(t_env, agg_env_z, color="#202020", lw=1.0, label="cross-unit median envelope z")
+    ax.axhline(float(threshold_z), color="#d62728", ls="--", lw=1.2, label=f"gate z={float(threshold_z):g}")
+    for phrase in phrases:
+        phrase_id = str(phrase.get("phrase_id", ""))
+        selected = phrase_id == str(selected_phrase_id)
+        ax.axvspan(
+            float(phrase["start_s"]),
+            float(phrase["end_s"]),
+            color="#ff7f0e" if selected else "#b0b0b0",
+            alpha=0.28 if selected else 0.10,
+        )
+        for syl in phrase.get("syllables", []):
+            ax.axvspan(
+                float(syl["start_s"]),
+                float(syl["end_s"]),
+                color="#1f77b4",
+                alpha=0.18 if selected else 0.05,
+            )
+    ax.set_xlabel("Time in reference clip (s)")
+    ax.set_ylabel("Aggregate band-limited envelope z")
+    ax.set_title(f"Multisyllable phrase detection, bandpass {bandpass_hz[0]:.0f}-{bandpass_hz[1]:.0f} Hz")
+    ax.legend(loc="upper right")
+    if np.isfinite(agg_env_z).any():
+        ax.set_ylim(bottom=min(-2.0, float(np.nanpercentile(agg_env_z, 1))))
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def select_multisyllable_reference_candidate(
+    result: BirdnetClipDetectionResult,
+    ref_unit: str,
+    unit_files: Dict[str, Any],
+    clocks: Dict[str, Any],
+    units: Sequence[str],
+    bandpass_hz: Tuple[float, float],
+    *,
+    hint_s: float | None = None,
+    envelope_z_threshold: float = 7.0,
+    envelope_smooth_ms: float = 8.0,
+    phrase_merge_gap_s: float = 0.35,
+    phrase_min_duration_s: float = 0.25,
+    phrase_min_syllables: int = 2,
+) -> tuple[BirdcallCandidate | None, List[BirdcallCandidate], dict, List[dict], np.ndarray, np.ndarray]:
+    diagnostic_candidates = list(result.candidates_by_unit.get(ref_unit, []))
+    phrases, t_env, agg_env_z = build_multisyllable_phrase_windows(
+        result,
+        unit_files,
+        clocks,
+        units,
+        ref_unit,
+        bandpass_hz,
+        envelope_z_threshold=envelope_z_threshold,
+        envelope_smooth_ms=envelope_smooth_ms,
+        phrase_merge_gap_s=phrase_merge_gap_s,
+        phrase_min_duration_s=phrase_min_duration_s,
+        phrase_min_syllables=phrase_min_syllables,
+    )
+    selectable = [
+        phrase for phrase in phrases
+        if ref_unit in {u for u in str(phrase.get("units", "")).split(",") if u}
+    ]
+    if not selectable:
+        return None, diagnostic_candidates, {}, phrases, t_env, agg_env_z
+
+    def distance_to_hint(phrase: dict) -> float:
+        if hint_s is None:
+            return float("nan")
+        start_s = float(phrase["start_s"])
+        end_s = float(phrase["end_s"])
+        if start_s <= float(hint_s) <= end_s:
+            return 0.0
+        return min(abs(float(hint_s) - start_s), abs(float(hint_s) - end_s))
+
+    if hint_s is not None:
+        selectable.sort(key=lambda p: (
+            0 if float(p["start_s"]) <= float(hint_s) <= float(p["end_s"]) else 1,
+            distance_to_hint(p),
+            -int(p.get("n_syllables", 0)),
+            -float(p.get("envelope_peak_z", float("nan"))),
+            -float(p.get("max_confidence", float("nan"))),
+            float(p["start_s"]),
+            str(p["species_name"]),
+        ))
+    else:
+        selectable.sort(key=lambda p: (
+            -float(p.get("max_confidence", float("nan"))),
+            -float(p.get("envelope_peak_z", float("nan"))),
+            -int(p.get("n_syllables", 0)),
+            float(p["start_s"]),
+            str(p["species_name"]),
+        ))
+
+    phrase = selectable[0]
+    start_s = float(phrase["start_s"])
+    end_s = float(phrase["end_s"])
+    distance = distance_to_hint(phrase)
+    candidate = BirdcallCandidate(
+        unit=ref_unit,
+        start_s=start_s,
+        end_s=end_s,
+        center_s=0.5 * (start_s + end_s),
+        species_name=str(phrase["species_name"]),
+        confidence=float(phrase["max_confidence"]),
+        score=float(phrase["avg_confidence"]),
+        source_count=int(phrase["source_windows"]),
+        quality=f"multisyllable_phrase_{phrase['phrase_id']}",
+        distance_to_hint_s=distance,
+    )
+    selected_call = dict(phrase)
+    selected_call.pop("syllables", None)
+    selected_call["call_id"] = str(phrase["phrase_id"])
+    selected_call["distance_to_hint_s"] = distance
+    return candidate, diagnostic_candidates, selected_call, phrases, t_env, agg_env_z
 
 
 def _resolve_species_list(

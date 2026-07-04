@@ -33,13 +33,13 @@ location:
   weight_floor_m: 2.0
 
 clips:
-  output_root: /home/shishir/aru-dashboard/data/event_clips
+  output_root: data/event_clips
 
 # Pipeline/dashboard integration. The dashboard expects the ARU pipeline scripts
 # from aru_pipeline_scripts_with_acquire.zip to be copied into this directory.
 pipeline:
-  script_dir: /home/shishir/aru-dashboard/aru_pipeline
-  python: /home/shishir/aru-dashboard/.venv/bin/python
+  script_dir: aru_pipeline
+  python: .venv/bin/python
   acquire_script: acquire.py
   calibrate_script: aru_calibrate_session.py
   localize_script: aru_localize_event.py
@@ -47,15 +47,15 @@ pipeline:
   finalize_wait_s: 10
 
 jobs:
-  root: /home/shishir/aru-dashboard/data/jobs
+  root: data/jobs
 
 calibrations:
-  root: /home/shishir/aru-dashboard/data/calibrations
-  active_file: /home/shishir/aru-dashboard/data/calibrations/active_session_calibration.txt
+  root: data/calibrations
+  active_file: data/calibrations/active_session_calibration.txt
 
 localizations:
-  root: /home/shishir/aru-dashboard/data/localizations
+  root: data/localizations
 
 location_overrides:
-  root: /home/shishir/aru-dashboard/data/location_overrides
-  active_file: /home/shishir/aru-dashboard/data/location_overrides/active_location_override.txt
+  root: data/location_overrides
+  active_file: data/location_overrides/active_location_override.txt

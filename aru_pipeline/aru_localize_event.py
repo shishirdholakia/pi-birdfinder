@@ -28,7 +28,7 @@ from align import (
     robust_envelope,
 )
 from tdoa import build_tdoa_from_alignment, physical_sanity
-from calibration import extract_timing_offsets_from_tables
+from calibration import default_station_offset_calibration_path, extract_timing_offsets_from_tables
 from localize import localize_least_squares, leave_one_out_localizations, mc_location_samples, covariance_ellipse
 from maps import write_event_map
 from viz import plot_alignment_diagnostics
@@ -718,7 +718,13 @@ def _birdnet_pick_and_align(
     ref_latlon,
     outdir: Path,
 ):
-    from aru_birdnet_clip_detect import run_clip_detection, select_reference_candidate
+    from aru_birdnet_clip_detect import (
+        plot_multisyllable_phrase_diagnostic,
+        run_clip_detection,
+        select_multisyllable_reference_candidate,
+        select_reference_candidate,
+        write_multisyllable_phrase_windows_csv,
+    )
     from birdnet_detect import write_birdnet_candidates_csv
 
     hint_s = parse_offset_seconds(args.event_ref_offset) if args.event_ref_offset else None
@@ -753,12 +759,54 @@ def _birdnet_pick_and_align(
     )
     if args.ref not in result.predictions_by_unit:
         raise SystemExit(f"BirdNET detection did not produce predictions for reference unit {args.ref!r}")
-    candidate, candidates, selected_call = select_reference_candidate(
-        result,
-        args.ref,
-        hint_s=hint_s,
-        hint_fallback_half_s=args.bird_refine_hint_half_s,
-    )
+    phrase_windows_csv = outdir / "birdcall_phrase_windows.csv"
+    phrase_envelope_plot = outdir / "diagnostics" / "envelope" / "birdcall_phrase_envelope.png"
+    phrase_windows = []
+    selected_phrase_id = ""
+    window_source = "minimal"
+    if args.birdcall_window_mode == "minimal":
+        candidate, candidates, selected_call = select_reference_candidate(
+            result,
+            args.ref,
+            hint_s=hint_s,
+            hint_fallback_half_s=args.bird_refine_hint_half_s,
+        )
+    else:
+        candidate, candidates, selected_call, phrase_windows, phrase_t_env, phrase_env_z = select_multisyllable_reference_candidate(
+            result,
+            args.ref,
+            unit_files,
+            clocks,
+            units,
+            bandpass_hz,
+            hint_s=hint_s,
+            envelope_z_threshold=args.birdcall_envelope_z_threshold,
+            envelope_smooth_ms=args.birdcall_envelope_smooth_ms,
+            phrase_merge_gap_s=args.birdcall_phrase_merge_gap_s,
+            phrase_min_duration_s=args.birdcall_phrase_min_duration_s,
+            phrase_min_syllables=args.birdcall_phrase_min_syllables,
+        )
+        selected_phrase_id = str(selected_call.get("phrase_id") or selected_call.get("call_id") or "") if selected_call else ""
+        write_multisyllable_phrase_windows_csv(phrase_windows_csv, phrase_windows, selected_phrase_id=selected_phrase_id)
+        plot_multisyllable_phrase_diagnostic(
+            phrase_envelope_plot,
+            phrase_t_env,
+            phrase_env_z,
+            phrase_windows,
+            selected_phrase_id,
+            args.birdcall_envelope_z_threshold,
+            bandpass_hz,
+        )
+        if candidate is None:
+            candidate, candidates, selected_call = select_reference_candidate(
+                result,
+                args.ref,
+                hint_s=hint_s,
+                hint_fallback_half_s=args.bird_refine_hint_half_s,
+            )
+            window_source = "minimal_fallback"
+        else:
+            window_source = "multisyllable_phrase"
     pred_path = outdir / "birdnet_predictions.csv"
     result.predictions_by_unit[args.ref].to_csv(pred_path, index=False)
     write_birdnet_candidates_csv(outdir / "birdnet_candidates.csv", candidates, selected=candidate)
@@ -827,6 +875,10 @@ def _birdnet_pick_and_align(
         "calls_txt": result.out_txt,
         "calls_csv": outdir / "birdnet_calls.csv",
         "selected_call": selected_call,
+        "birdcall_window_mode": args.birdcall_window_mode,
+        "birdcall_window_source": window_source,
+        "phrase_windows_csv": phrase_windows_csv if args.birdcall_window_mode == "multisyllable" else "",
+        "phrase_envelope_plot": phrase_envelope_plot if args.birdcall_window_mode == "multisyllable" else "",
         "effective_align_start_s": effective_align_start_s,
         "effective_align_end_s": effective_align_end_s,
         "effective_align_duration_s": effective_align_duration_s,
@@ -1020,7 +1072,12 @@ def main() -> int:
     p.add_argument("--event-ref-offset", default=None, help="Manual offset into ref-unit clip. For impulse mode, omit this to auto-detect a clap anywhere in the clip.")
     p.add_argument("--units", default="zero,one,four,five")
     p.add_argument("--locations", default=None, help="Optional station override TXT with [stations].")
-    p.add_argument("--calibration-txt", default=None, help="TXT calibration from aru_calibrate_session.py")
+    p.add_argument(
+        "--calibration-txt",
+        default=None,
+        help="TXT calibration from aru_calibrate_session.py. If omitted, the default station-offset calibration is used when present.",
+    )
+    p.add_argument("--no-calibration", action="store_true", help="Disable automatic/default station-offset calibration.")
     p.add_argument("--sound-speed", type=float, default=343.0)
     p.add_argument("--max-tau-s", type=float, default=0.10)
     p.add_argument("--gcc-phat-exponent", type=float, default=1.0, help="0.0 is GCC, 1.0 is GCC-PHAT, 0.25 is lightly whitened GCC.")
@@ -1046,6 +1103,12 @@ def main() -> int:
     p.add_argument("--birdnet-geo-week", type=int, default=None, help="BirdNET 1..48 week override for generated species.txt. Default: infer from event clip date.")
     p.add_argument("--birdnet-geo-min-confidence", type=float, default=0.03, help="Minimum BirdNET geo prior confidence for generated species.txt.")
     p.add_argument("--no-birdnet-location-species-list", action="store_true", help="Disable automatic generated species.txt for BirdNET runs.")
+    p.add_argument("--birdcall-window-mode", choices=["multisyllable", "minimal"], default="multisyllable", help="BirdNET birdcall window selector. Default groups minimal calls into multisyllable phrase windows.")
+    p.add_argument("--birdcall-envelope-z-threshold", type=float, default=7.0, help="Cross-unit band-limited envelope z threshold for multisyllable phrase detection.")
+    p.add_argument("--birdcall-envelope-smooth-ms", type=float, default=8.0, help="Envelope smoothing for multisyllable phrase detection.")
+    p.add_argument("--birdcall-phrase-merge-gap-s", type=float, default=0.35, help="Merge same-species gated minimal calls into one phrase across gaps up to this duration.")
+    p.add_argument("--birdcall-phrase-min-duration-s", type=float, default=0.25, help="Minimum selected multisyllable phrase duration.")
+    p.add_argument("--birdcall-phrase-min-syllables", type=int, default=2, help="Minimum number of gated minimal calls required for a multisyllable phrase.")
     p.add_argument("--bird-align-pad-before-s", type=float, default=0.08)
     p.add_argument("--bird-align-pad-after-s", type=float, default=0.16)
     p.add_argument("--bird-refine-hint-half-s", type=float, default=0.35, help="When --event-ref-offset is supplied, refine BirdNET timing only within this half-window.")
@@ -1077,15 +1140,33 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     if args.bird_geometric_max_peak_rank < 1:
         raise SystemExit("--bird-geometric-max-peak-rank must be >= 1")
+    if args.birdcall_phrase_min_syllables < 1:
+        raise SystemExit("--birdcall-phrase-min-syllables must be >= 1")
+    if args.birdcall_phrase_min_duration_s < 0.0:
+        raise SystemExit("--birdcall-phrase-min-duration-s must be >= 0")
+    if args.birdcall_phrase_merge_gap_s < 0.0:
+        raise SystemExit("--birdcall-phrase-merge-gap-s must be >= 0")
     units = [u.strip() for u in args.units.split(",") if u.strip()]
     unit_files = find_unit_files(event_dir, units)
     if args.ref not in unit_files:
         raise SystemExit(f"Reference unit {args.ref!r} missing from event dir")
 
     # Locations: calibration fit wins if present; otherwise event_dir location summaries / override file.
-    timing_offsets, cal_latlon = load_calibration(Path(args.calibration_txt), args.ref) if args.calibration_txt else ({}, None)
+    if args.no_calibration and args.calibration_txt:
+        raise SystemExit("--no-calibration cannot be used with --calibration-txt")
+    calibration_txt = None
+    if not args.no_calibration:
+        if args.calibration_txt:
+            calibration_txt = Path(args.calibration_txt).expanduser()
+            if not calibration_txt.exists():
+                raise SystemExit(f"Calibration TXT not found: {calibration_txt}")
+        else:
+            default_calibration = default_station_offset_calibration_path()
+            if default_calibration.exists():
+                calibration_txt = default_calibration
+    timing_offsets, cal_latlon = load_calibration(calibration_txt, args.ref) if calibration_txt else ({}, None)
     if cal_latlon:
-        stations = {u: {"lat": ll[0], "lon": ll[1], "sigma_m": 1.0, "source": args.calibration_txt} for u, ll in cal_latlon.items() if u in unit_files}
+        stations = {u: {"lat": ll[0], "lon": ll[1], "sigma_m": 1.0, "source": str(calibration_txt)} for u, ll in cal_latlon.items() if u in unit_files}
     else:
         stations = load_station_locations(event_dir, units=units, override_txt=Path(args.locations) if args.locations else None)
     missing = [u for u in unit_files if u not in stations]
@@ -1210,7 +1291,7 @@ def main() -> int:
         f.write(f"event_dir = {event_dir}\n")
         f.write(f"ref_unit = {args.ref}\n")
         f.write(f"mode = {args.mode}\n")
-        f.write(f"calibration_txt = {args.calibration_txt or ''}\n")
+        f.write(f"calibration_txt = {calibration_txt or ''}\n")
         f.write(f"gcc_phat_exponent = {args.gcc_phat_exponent:.6f}\n")
         f.write(f"event_pick_ref_unit = {args.ref}\n")
         f.write(f"event_pick_sample = {ref_pick.sample}\n")
@@ -1241,6 +1322,8 @@ def main() -> int:
             f.write(f"birdnet_window_duration_s = {float(cand.end_s) - float(cand.start_s):.9f}\n")
             f.write(f"birdnet_detector_score = {cand.score:.9f}\n")
             selected_call = pick_meta.get("selected_call") or {}
+            f.write(f"birdcall_window_mode = {pick_meta.get('birdcall_window_mode', '')}\n")
+            f.write(f"birdcall_window_source = {pick_meta.get('birdcall_window_source', '')}\n")
             f.write(f"birdnet_selected_call_id = {selected_call.get('call_id', '')}\n")
             f.write(f"birdnet_selected_units = {selected_call.get('units', '')}\n")
             f.write(f"birdnet_selected_per_unit_confidence = {selected_call.get('per_unit_confidence', '')}\n")
@@ -1249,6 +1332,21 @@ def main() -> int:
                 f.write(f"birdnet_selected_distance_to_hint_s = {dist:.9f}\n")
             else:
                 f.write("birdnet_selected_distance_to_hint_s = \n")
+            phrase_source = str(pick_meta.get("birdcall_window_source", ""))
+            if phrase_source == "multisyllable_phrase":
+                f.write(f"birdcall_phrase_start_s = {float(selected_call.get('start_s', float('nan'))):.9f}\n")
+                f.write(f"birdcall_phrase_end_s = {float(selected_call.get('end_s', float('nan'))):.9f}\n")
+                f.write(f"birdcall_phrase_duration_s = {float(selected_call.get('duration_s', float('nan'))):.9f}\n")
+                f.write(f"birdcall_phrase_n_syllables = {selected_call.get('n_syllables', '')}\n")
+                f.write(f"birdcall_phrase_envelope_peak_z = {float(selected_call.get('envelope_peak_z', float('nan'))):.9f}\n")
+                f.write(f"birdcall_phrase_syllable_windows_s = {selected_call.get('syllable_windows_s', '')}\n")
+            else:
+                f.write("birdcall_phrase_start_s = \n")
+                f.write("birdcall_phrase_end_s = \n")
+                f.write("birdcall_phrase_duration_s = \n")
+                f.write("birdcall_phrase_n_syllables = \n")
+                f.write("birdcall_phrase_envelope_peak_z = \n")
+                f.write("birdcall_phrase_syllable_windows_s = \n")
             f.write(f"birdcall_alignment_window_start_s = {float(pick_meta.get('effective_align_start_s', float('nan'))):.9f}\n")
             f.write(f"birdcall_alignment_window_end_s = {float(pick_meta.get('effective_align_end_s', float('nan'))):.9f}\n")
             f.write(f"birdcall_alignment_window_duration_s = {float(pick_meta.get('effective_align_duration_s', float('nan'))):.9f}\n")
@@ -1257,6 +1355,8 @@ def main() -> int:
             f.write(f"birdnet_predictions_csv = {pick_meta.get('predictions_csv')}\n")
             f.write(f"birdnet_calls_txt = {pick_meta.get('calls_txt')}\n")
             f.write(f"birdnet_calls_csv = {pick_meta.get('calls_csv')}\n")
+            f.write(f"birdcall_phrase_windows_csv = {pick_meta.get('phrase_windows_csv', '')}\n")
+            f.write(f"birdcall_phrase_envelope_plot = {pick_meta.get('phrase_envelope_plot', '')}\n")
             f.write(f"geometric_peak_combos_csv = {pick_meta.get('geometric_peak_combos_csv')}\n")
         f.write(f"source_lat = {source_ll[0]:.9f}\n")
         f.write(f"source_lon = {source_ll[1]:.9f}\n")

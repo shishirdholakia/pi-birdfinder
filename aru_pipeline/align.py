@@ -654,10 +654,50 @@ def fine_align_birdcall(
     envelope_weight: float = 0.25,
 ) -> FineAlignment:
     ref_uf = unit_files[ref_unit]
-    uf = unit_files[unit]
     fs, _, dur_s = audio_info(ref_uf.flac_path)
     ref_start_s = max(0.0, float(ref_pick.window_start_s) - float(pad_before_s))
     ref_end_s = min(float(dur_s), float(ref_pick.window_end_s) + float(pad_after_s))
+    return fine_align_birdcall_interval(
+        unit,
+        ref_unit,
+        unit_files,
+        clocks,
+        ref_pick,
+        ref_start_s=ref_start_s,
+        ref_end_s=ref_end_s,
+        max_tau_s=max_tau_s,
+        bandpass_hz=bandpass_hz,
+        env_smooth_ms=env_smooth_ms,
+        physical_max_tau_s=physical_max_tau_s,
+        physical_slack_s=physical_slack_s,
+        timing_offset_shift_s=timing_offset_shift_s,
+        gcc_phat_exponent=gcc_phat_exponent,
+        envelope_weight=envelope_weight,
+    )
+
+
+def fine_align_birdcall_interval(
+    unit: str,
+    ref_unit: str,
+    unit_files: Dict[str, UnitFiles],
+    clocks: Dict[str, Any],
+    ref_pick: BirdcallPick,
+    ref_start_s: float,
+    ref_end_s: float,
+    max_tau_s: float = 0.10,
+    bandpass_hz: Tuple[float, float] = (1000.0, 9000.0),
+    env_smooth_ms: float = 8.0,
+    physical_max_tau_s: Optional[float] = None,
+    physical_slack_s: float = 0.0015,
+    timing_offset_shift_s: float = 0.0,
+    gcc_phat_exponent: float = 1.0,
+    envelope_weight: float = 0.25,
+) -> FineAlignment:
+    ref_uf = unit_files[ref_unit]
+    uf = unit_files[unit]
+    fs, _, dur_s = audio_info(ref_uf.flac_path)
+    ref_start_s = max(0.0, min(float(ref_start_s), float(dur_s)))
+    ref_end_s = max(0.0, min(float(ref_end_s), float(dur_s)))
     dur = max(0.05, ref_end_s - ref_start_s)
     ref_start = int(round(ref_start_s * fs))
     ref_start_abs = clocks[ref_unit].time_from_sample(ref_start)

@@ -113,8 +113,25 @@
       <select id="loc-calibration"><option value="active">active</option><option value="none">none</option></select>
       <label>Event offset in ref clip, optional</label>
       <input id="loc-offset" type="text" placeholder="middle of clip">
-      <label>Bird bandpass Hz</label>
-      <input id="loc-bird-bandpass" type="text" value="1000,9000">
+      <div id="loc-birdcall-controls" class="conditional-fields" hidden>
+        <label>Birdcall window mode</label>
+        <select id="loc-birdcall-window-mode"><option value="multisyllable">multisyllable</option><option value="minimal">minimal</option></select>
+        <label>Bird bandpass Hz</label>
+        <input id="loc-bird-bandpass" type="text" value="3000,8000">
+        <details class="advanced-controls">
+          <summary>Advanced BirdNET phrase picker</summary>
+          <label>Envelope z threshold</label>
+          <input id="loc-birdcall-envelope-z" type="number" value="7.0" step="0.1">
+          <label>Envelope smoothing, ms</label>
+          <input id="loc-birdcall-envelope-smooth-ms" type="number" value="8.0" step="0.5">
+          <label>Phrase merge gap, s</label>
+          <input id="loc-birdcall-phrase-merge-gap" type="number" value="0.35" step="0.01">
+          <label>Minimum phrase duration, s</label>
+          <input id="loc-birdcall-phrase-min-duration" type="number" value="0.25" step="0.01">
+          <label>Minimum syllables</label>
+          <input id="loc-birdcall-phrase-min-syllables" type="number" value="2" min="1" step="1">
+        </details>
+      </div>
       <label class="check"><input id="loc-use-overrides" type="checkbox" checked> Use saved map overrides if enabled</label>
       <button onclick="submitLocalize()">Acquire + localize</button>
     </div>

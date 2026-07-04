@@ -11,6 +11,7 @@ function val(id) { return document.getElementById(id)?.value?.trim() || ""; }
 function checked(id) { return !!document.getElementById(id)?.checked; }
 function escapeHTML(s) { return String(s).replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c])); }
 function setText(id, text) { const el = document.getElementById(id); if (el) el.textContent = text; }
+function setPayloadValue(payload, key, id) { const raw = val(id); if (raw !== "") payload[key] = raw; }
 async function postAction(url) { try { const r = await fetch(url, {method:"POST"}); if (!r.ok) throw new Error(await r.text()); await refreshAll(); } catch(e) { alert(`Action failed: ${e}`); } }
 async function postJSON(url, payload) { const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)}); if (!r.ok) throw new Error(await r.text()); return await r.json(); }
 
@@ -309,6 +310,9 @@ async function saveMapOverrides() {
   try {
     const payload = collectOverridePayload();
     if (Object.keys(payload.units).length === 0) return alert("No override pins to save. Create pins from averages or place pins on the map first.");
+    payload.enabled = true;
+    const enabledBox = document.getElementById("map-override-enabled");
+    if (enabledBox) enabledBox.checked = true;
     const res = await postJSON("/api/map/location-overrides", payload);
     overrideDirty = false;
     setMapStatus(`Saved override file: ${res.path}`, "good-text");
@@ -375,6 +379,9 @@ async function loadLatestResultLayers(kind) {
 async function saveMapOverridesSilentlyIfNeeded(useOverrides) {
   if (!useOverrides || !overrideDirty || Object.keys(overrideMarkers).length === 0) return;
   const payload = collectOverridePayload();
+  payload.enabled = true;
+  const enabledBox = document.getElementById("map-override-enabled");
+  if (enabledBox) enabledBox.checked = true;
   await postJSON("/api/map/location-overrides", payload);
   overrideDirty = false;
   setMapStatus("Saved pending override pin edits before starting job.", "good-text");
@@ -401,9 +408,25 @@ async function submitCalibrate() {
     await refreshAll();
   } catch(e) { alert(`Calibration failed to start: ${e}`); }
 }
+function syncLocalizeModeControls() {
+  const isBirdcall = (val("loc-mode") || "impulse") === "birdcall";
+  const birdcallControls = document.getElementById("loc-birdcall-controls");
+  if (birdcallControls) birdcallControls.hidden = !isBirdcall;
+}
 async function submitLocalize() {
   try {
-    const payload = {timestamp:val("loc-timestamp"), clip_half_s:Number(val("loc-half")||30), units:"zero,one,four,five", ref:"five", mode:val("loc-mode")||"impulse", calibration:val("loc-calibration")||"active", event_ref_offset:val("loc-offset"), bird_bandpass:val("loc-bird-bandpass")||"1000,9000", use_location_override:checked("loc-use-overrides")};
+    const mode = val("loc-mode") || "impulse";
+    const payload = {timestamp:val("loc-timestamp"), clip_half_s:Number(val("loc-half")||30), units:"zero,one,four,five", ref:"five", mode, calibration:val("loc-calibration")||"active", event_ref_offset:val("loc-offset"), use_location_override:checked("loc-use-overrides")};
+    if (mode === "birdcall") {
+      payload.birdnet_detect = true;
+      payload.bird_bandpass = val("loc-bird-bandpass") || "3000,8000";
+      payload.birdcall_window_mode = val("loc-birdcall-window-mode") || "multisyllable";
+      setPayloadValue(payload, "birdcall_envelope_z_threshold", "loc-birdcall-envelope-z");
+      setPayloadValue(payload, "birdcall_envelope_smooth_ms", "loc-birdcall-envelope-smooth-ms");
+      setPayloadValue(payload, "birdcall_phrase_merge_gap_s", "loc-birdcall-phrase-merge-gap");
+      setPayloadValue(payload, "birdcall_phrase_min_duration_s", "loc-birdcall-phrase-min-duration");
+      setPayloadValue(payload, "birdcall_phrase_min_syllables", "loc-birdcall-phrase-min-syllables");
+    }
     if (!payload.timestamp) return alert("Timestamp is required.");
     await saveMapOverridesSilentlyIfNeeded(payload.use_location_override);
     await postJSON("/api/jobs/localize", payload);
@@ -414,9 +437,30 @@ async function submitLocalize() {
 // -----------------------------------------------------------------------------
 // Artifacts and status rendering
 // -----------------------------------------------------------------------------
+function artifactPriority(a) {
+  const name = String(a?.name || "").toLowerCase();
+  const path = String(a?.path || "").toLowerCase();
+  const checks = [
+    ["localization_map.html", 0],
+    ["localization_summary.txt", 1],
+    ["event_tdoa.csv", 2],
+    ["birdcall_phrase_windows.csv", 3],
+    ["birdcall_phrase_envelope.png", 4],
+    ["birdnet_calls.csv", 5],
+    ["birdnet_calls.txt", 6],
+    ["diagnostics/correlation", 7]
+  ];
+  for (const [needle, rank] of checks) {
+    if (name.includes(needle) || path.includes(needle)) return rank;
+  }
+  if (a?.kind === "html") return 20;
+  if (a?.kind === "image") return 30;
+  if (a?.kind === "text") return 40;
+  return 50;
+}
 function artifactLinks(artifacts, max=8) {
   if (!artifacts || artifacts.length===0) return "—";
-  return artifacts.slice(0,max).map(a => `<button class="link-button" onclick='previewArtifact(${JSON.stringify(a)})'>${escapeHTML(a.name)}</button>`).join(" ");
+  return artifacts.map((a, i) => ({a, i})).sort((x, y) => artifactPriority(x.a) - artifactPriority(y.a) || x.i - y.i).slice(0,max).map(({a}) => `<button class="link-button" onclick='previewArtifact(${JSON.stringify(a)})'>${escapeHTML(a.name)}</button>`).join(" ");
 }
 async function previewArtifact(a) {
   const box=document.getElementById("artifact-preview"); if (!a || !box) return;
@@ -506,6 +550,9 @@ async function refreshAll() {
 document.addEventListener("DOMContentLoaded", () => {
   initMap();
   refreshMapLocations();
+  syncLocalizeModeControls();
+  const modeSelect = document.getElementById("loc-mode");
+  if (modeSelect) modeSelect.addEventListener("change", syncLocalizeModeControls);
 });
 refreshAll();
 setInterval(refreshAll, 3000);
